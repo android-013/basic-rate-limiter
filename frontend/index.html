@@ -1,0 +1,337 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Auth Mock (Stay Signed In)</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 28px; background: #fafafa; color: #111; }
+    .wrap { max-width: 980px; margin: 0 auto; }
+    .top { display: flex; justify-content: space-between; gap: 12px; align-items: center; flex-wrap: wrap; }
+    .card { background: #fff; border: 1px solid #e5e5e5; border-radius: 12px; padding: 18px; box-shadow: 0 1px 3px rgba(0,0,0,.04); }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 16px; }
+    @media (max-width: 860px) { .grid { grid-template-columns: 1fr; } }
+    h1 { font-size: 20px; margin: 0; }
+    .muted { color: #666; font-size: 13px; }
+    label { display: block; font-size: 13px; color: #333; margin: 10px 0 6px; }
+    input { width: 100%; padding: 10px 12px; border: 1px solid #ddd; border-radius: 10px; font-size: 14px; }
+    button { padding: 10px 12px; border: 1px solid #ddd; background: #111; color: #fff; border-radius: 10px; cursor: pointer; }
+    button.secondary { background: #fff; color: #111; }
+    button:disabled { opacity: .6; cursor: not-allowed; }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-top: 12px; }
+    .pill { font-size: 12px; padding: 6px 10px; border-radius: 999px; border: 1px solid #ddd; background: #fff; }
+    pre { background: #0b1020; color: #d7e1ff; padding: 14px; border-radius: 12px; overflow: auto; font-size: 12px; line-height: 1.4; }
+    .ok { color: #0a7a0a; font-weight: 600; }
+    .bad { color: #b00020; font-weight: 600; }
+    .status { margin-left: auto; }
+    .kv { display: grid; grid-template-columns: 140px 1fr; gap: 8px 12px; margin-top: 8px; font-size: 13px; }
+    .kv div { padding: 4px 0; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="top">
+      <div>
+        <h1>Signup / Sign-in Mock (Persistent Login)</h1>
+        <div class="muted">Frontend origin: <span id="origin"></span></div>
+      </div>
+
+      <div class="card" style="min-width: 340px;">
+        <label>Backend Base URL</label>
+        <input id="baseUrl" value="http://localhost:4000" />
+        <div class="row">
+          <span class="pill">Access: <span id="accessState">none</span></span>
+          <span class="pill">Refresh: <span id="refreshState">none</span></span>
+          <span class="status" id="status"></span>
+        </div>
+
+        <div class="kv">
+          <div class="muted">User</div><div id="userLine" class="muted">Not signed in</div>
+          <div class="muted">Access exp</div><div id="accessExp" class="muted">—</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <h2 style="margin:0 0 8px; font-size:16px;">Create Account</h2>
+        <div class="muted">User records are stored temporarily in <b>backend/user.json</b>.</div>
+
+        <label>Name</label>
+        <input id="suName" placeholder="e.g., Jane Doe" />
+
+        <label>Email</label>
+        <input id="suEmail" placeholder="e.g., jane@example.com" />
+
+        <label>Password</label>
+        <input id="suPassword" type="password" placeholder="Minimum 8 characters" />
+
+        <div class="row">
+          <button id="btnSignup">Sign up</button>
+          <button class="secondary" id="btnHealth">Check API health</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2 style="margin:0 0 8px; font-size:16px;">Sign In</h2>
+
+        <label>Email</label>
+        <input id="siEmail" placeholder="e.g., jane@example.com" />
+
+        <label>Password</label>
+        <input id="siPassword" type="password" placeholder="Your password" />
+
+        <div class="row">
+          <button id="btnSignin">Sign in</button>
+          <button class="secondary" id="btnMe">Get /api/me</button>
+          <button class="secondary" id="btnLogout">Logout</button>
+          <button class="secondary" id="btnClear">Clear log</button>
+        </div>
+
+        <div class="muted" style="margin-top:10px;">
+          Note: The app will automatically refresh the access token as needed, keeping the user signed in unless they log out.
+        </div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:16px;">
+      <div class="muted">Output</div>
+      <pre id="out">{}</pre>
+    </div>
+  </div>
+
+  <script>
+    const originEl = document.getElementById("origin");
+    const baseUrlEl = document.getElementById("baseUrl");
+    const outEl = document.getElementById("out");
+    const statusEl = document.getElementById("status");
+
+    const accessStateEl = document.getElementById("accessState");
+    const refreshStateEl = document.getElementById("refreshState");
+    const userLineEl = document.getElementById("userLine");
+    const accessExpEl = document.getElementById("accessExp");
+
+    originEl.textContent = window.location.origin;
+
+    function setStatus(ok, text) {
+      statusEl.innerHTML = `<span class="${ok ? "ok" : "bad"}">${text}</span>`;
+    }
+
+    function setLog(obj) {
+      outEl.textContent = JSON.stringify(obj, null, 2);
+    }
+
+    function getAccessToken() {
+      return localStorage.getItem("access_token") || "";
+    }
+
+    function getRefreshToken() {
+      return localStorage.getItem("refresh_token") || "";
+    }
+
+    function setTokens(accessToken, refreshToken) {
+      if (accessToken) localStorage.setItem("access_token", accessToken);
+      if (refreshToken) localStorage.setItem("refresh_token", refreshToken);
+      updateTokenUI();
+    }
+
+    function clearTokens() {
+      localStorage.removeItem("access_token");
+      localStorage.removeItem("refresh_token");
+      updateTokenUI();
+      setUserUI(null);
+    }
+
+    function decodeJwt(token) {
+      // Basic JWT payload decode (no validation, used only for UI)
+      try {
+        const payload = token.split(".")[1];
+        const base64 = payload.replace(/-/g, "+").replace(/_/g, "/");
+        const json = decodeURIComponent(atob(base64).split("").map(c =>
+          "%" + ("00" + c.charCodeAt(0).toString(16)).slice(-2)
+        ).join(""));
+        return JSON.parse(json);
+      } catch {
+        return null;
+      }
+    }
+
+    function updateTokenUI() {
+      const at = getAccessToken();
+      const rt = getRefreshToken();
+
+      accessStateEl.textContent = at ? "present" : "none";
+      refreshStateEl.textContent = rt ? "present" : "none";
+
+      const payload = at ? decodeJwt(at) : null;
+      if (payload && payload.exp) {
+        const expMs = payload.exp * 1000;
+        accessExpEl.textContent = new Date(expMs).toLocaleString();
+      } else {
+        accessExpEl.textContent = "—";
+      }
+    }
+
+    function setUserUI(userPayload) {
+      if (!userPayload) {
+        userLineEl.textContent = "Not signed in";
+        return;
+      }
+      const name = userPayload.name || "User";
+      const email = userPayload.email || "";
+      userLineEl.textContent = `${name}${email ? " (" + email + ")" : ""}`;
+    }
+
+    updateTokenUI();
+
+    async function rawFetch(path, options = {}) {
+      const base = baseUrlEl.value.replace(/\/$/, "");
+      const url = base + path;
+
+      try {
+        const res = await fetch(url, { mode: "cors", ...options });
+        const text = await res.text();
+        let data;
+        try { data = JSON.parse(text); } catch { data = { raw: text }; }
+        return { res, data, url };
+      } catch (e) {
+        return { res: null, data: { error: String(e) }, url };
+      }
+    }
+
+    async function refreshSession() {
+      const refreshToken = getRefreshToken();
+      if (!refreshToken) return false;
+
+      const result = await rawFetch("/api/auth/refresh", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ refreshToken })
+      });
+
+      if (!result.res) {
+        setLog({ url: result.url, error: result.data.error });
+        setStatus(false, "Network/CORS error during refresh");
+        return false;
+      }
+
+      if (!result.res.ok || !result.data?.ok) {
+        return false;
+      }
+
+      setTokens(result.data.accessToken, result.data.refreshToken);
+      return true;
+    }
+
+    async function api(path, options = {}, retryOn401 = true) {
+      const base = baseUrlEl.value.replace(/\/$/, "");
+      const url = base + path;
+
+      const headers = Object.assign(
+        { "Content-Type": "application/json" },
+        options.headers || {}
+      );
+
+      const accessToken = getAccessToken();
+      if (accessToken) headers["Authorization"] = `Bearer ${accessToken}`;
+
+      setStatus(true, "Request sent...");
+
+      let res, data, text;
+      try {
+        res = await fetch(url, { mode: "cors", ...options, headers });
+        text = await res.text();
+        try { data = JSON.parse(text); } catch { data = { raw: text }; }
+      } catch (e) {
+        setLog({ url, error: String(e) });
+        setStatus(false, "Blocked by browser (CORS) or network error");
+        return null;
+      }
+
+      // If access token expired, attempt refresh and retry once
+      if (res.status === 401 && retryOn401 && getRefreshToken()) {
+        const refreshed = await refreshSession();
+        if (refreshed) {
+          return api(path, options, false);
+        } else {
+          clearTokens();
+          setLog({ url, status: res.status, ok: false, data, note: "Session expired; refresh failed" });
+          setStatus(false, "Session expired. Please sign in again.");
+          return null;
+        }
+      }
+
+      setLog({ url, status: res.status, ok: res.ok, data });
+      setStatus(res.ok, res.ok ? "Success" : "Request failed (see output)");
+
+      return { res, data };
+    }
+
+    // Attempt silent session restore on page load
+    (async function bootstrap() {
+      if (getRefreshToken() && !getAccessToken()) {
+        await refreshSession();
+      }
+
+      if (getAccessToken()) {
+        const payload = decodeJwt(getAccessToken());
+        if (payload) setUserUI(payload);
+
+        // Optional: validate token by calling /api/me (and refresh if needed)
+        await api("/api/me", { method: "GET" });
+      }
+    })();
+
+    document.getElementById("btnHealth").onclick = () => api("/api/health", { method: "GET" });
+
+    document.getElementById("btnSignup").onclick = async () => {
+      const payload = {
+        name: document.getElementById("suName").value.trim(),
+        email: document.getElementById("suEmail").value.trim(),
+        password: document.getElementById("suPassword").value
+      };
+      await api("/api/auth/signup", { method: "POST", body: JSON.stringify(payload) });
+    };
+
+    document.getElementById("btnSignin").onclick = async () => {
+      const payload = {
+        email: document.getElementById("siEmail").value.trim(),
+        password: document.getElementById("siPassword").value
+      };
+
+      const result = await api("/api/auth/signin", { method: "POST", body: JSON.stringify(payload) });
+      if (result && result.data && result.data.ok) {
+        setTokens(result.data.accessToken, result.data.refreshToken);
+        const accessPayload = decodeJwt(result.data.accessToken);
+        setUserUI(accessPayload);
+        setStatus(true, "Signed in successfully");
+      }
+    };
+
+    document.getElementById("btnMe").onclick = async () => {
+      const result = await api("/api/me", { method: "GET" });
+      if (result && result.data && result.data.ok && result.data.user) {
+        setUserUI(result.data.user);
+      }
+    };
+
+    document.getElementById("btnLogout").onclick = async () => {
+      const refreshToken = getRefreshToken();
+      if (refreshToken) {
+        await api("/api/auth/logout", {
+          method: "POST",
+          body: JSON.stringify({ refreshToken })
+        }, false);
+      }
+      clearTokens();
+      setStatus(true, "Logged out");
+      setLog({ ok: true, message: "Client tokens cleared and server refresh token revoked (if available)." });
+    };
+
+    document.getElementById("btnClear").onclick = () => {
+      setLog({});
+      setStatus(true, "Cleared");
+    };
+  </script>
+</body>
+</html>
