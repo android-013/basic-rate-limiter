@@ -248,6 +248,12 @@
         return null;
       }
 
+      if (res.status === 429) {
+        setStatus(false, "Rate limit reached. Please wait and try again.");
+        setLog({ url, status: res.status, ok: false, data });
+        return { res, data };
+      }
+
       // If access token expired, attempt refresh and retry once
       if (res.status === 401 && retryOn401 && getRefreshToken()) {
         const refreshed = await refreshSession();
