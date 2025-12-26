@@ -18,20 +18,23 @@ const app = express();
 const PORT = Number(process.env.PORT || 4000);
 const NODE_ENV = process.env.NODE_ENV || "development";
 
-// If you are behind a reverse proxy (NGINX/Cloudflare/Heroku), uncomment:
-// app.set("trust proxy", 1);
-
 const JWT_SECRET = process.env.JWT_SECRET || "";
 if (!JWT_SECRET || JWT_SECRET.length < 24) {
-  console.warn("WARNING: JWT_SECRET is missing or too short. Please set a long random value in backend/.env");
+  console.warn("WARNING: JWT_SECRET is missing/short. Please set a long random value in backend/.env");
 }
 
-// Sliding session
 const ACCESS_TOKEN_TTL = process.env.ACCESS_TOKEN_TTL || "15m";
 const REFRESH_TOKEN_TTL = process.env.REFRESH_TOKEN_TTL || "365d";
 
-// Rate limiting / slowdown (env configurable)
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+// Rate settings (env override supported)
 const API_WINDOW_MS = Number(process.env.API_WINDOW_MS || 60_000);
+const API_SLOW_AFTER = Number(process.env.API_SLOW_AFTER || 10);
+const API_SLOW_DELAY_MS = Number(process.env.API_SLOW_DELAY_MS || 10_000);
 const API_HARD_LIMIT = Number(process.env.API_HARD_LIMIT || 120);
 
 const AUTH_WINDOW_MS = Number(process.env.AUTH_WINDOW_MS || 60_000);
@@ -39,16 +42,12 @@ const AUTH_SLOW_AFTER = Number(process.env.AUTH_SLOW_AFTER || 10);
 const AUTH_SLOW_DELAY_MS = Number(process.env.AUTH_SLOW_DELAY_MS || 10_000);
 const AUTH_HARD_LIMIT = Number(process.env.AUTH_HARD_LIMIT || 30);
 
-// CORS allowlist
-const allowedOrigins = (process.env.ALLOWED_ORIGINS || "")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
-
-// Storage
 const usersFilePath = path.join(__dirname, "user.json");
 
-// -------------------- Helpers: users file --------------------
+// If you deploy behind a proxy (nginx / Cloudflare / Render / Heroku), enable this:
+// app.set("trust proxy", 1);
+
+// -------------------- Storage helpers (atomic write) --------------------
 async function ensureUsersFile() {
   try {
     await fs.access(usersFilePath);
@@ -69,18 +68,20 @@ async function readUsers() {
 }
 
 async function writeUsers(users) {
-  const tmpPath = usersFilePath + ".tmp";
-  await fs.writeFile(tmpPath, JSON.stringify(users, null, 2), "utf8");
-  await fs.rename(tmpPath, usersFilePath);
+  const tmp = usersFilePath + ".tmp";
+  await fs.writeFile(tmp, JSON.stringify(users, null, 2), "utf8");
+  await fs.rename(tmp, usersFilePath);
 }
 
 // -------------------- Validation helpers --------------------
 function normalizeEmail(email) {
   return String(email || "").trim().toLowerCase();
 }
+
 function isValidEmail(email) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 }
+
 function isStrongEnoughPassword(pw) {
   return typeof pw === "string" && pw.length >= 8;
 }
@@ -102,13 +103,13 @@ function signRefreshToken(user) {
   );
 }
 
-// -------------------- Middleware: basics --------------------
+// -------------------- Middleware: baseline security --------------------
 app.disable("x-powered-by");
 app.use(helmet());
 app.use(express.json({ limit: "50kb" }));
 app.use(morgan(NODE_ENV === "production" ? "combined" : "dev"));
 
-// -------------------- CORS (must run BEFORE limiters) --------------------
+// -------------------- CORS (strict allowlist) --------------------
 app.use(
   cors({
     origin: function (origin, cb) {
@@ -116,7 +117,7 @@ app.use(
         return cb(new Error("CORS blocked: missing Origin. Serve frontend via http:// (not file://)."));
       }
       if (!allowedOrigins.length) {
-        return cb(new Error("CORS blocked: server allowlist is empty. Set ALLOWED_ORIGINS in backend/.env"));
+        return cb(new Error("CORS blocked: ALLOWED_ORIGINS is empty in backend/.env"));
       }
       if (allowedOrigins.includes(origin)) return cb(null, true);
       return cb(new Error(`CORS blocked: Origin not allowed: ${origin}`));
@@ -126,31 +127,43 @@ app.use(
     maxAge: 86400
   })
 );
+
+// Preflight response (do not rate-limit OPTIONS)
 app.options("*", cors());
 
 // -------------------- Rate limiting + slowdown --------------------
 const skipOptions = (req) => req.method === "OPTIONS";
+const isAuthRoute = (req) => (req.originalUrl || "").startsWith("/api/auth");
 
-// General API hard limiter
-const apiLimiter = rateLimit({
+// API slowdown (exclude /api/auth)
+const apiSpeedLimiter = slowDown({
   windowMs: API_WINDOW_MS,
-  limit: API_HARD_LIMIT, // 'limit' renamed from 'max' in v7.x :contentReference[oaicite:1]{index=1}
+  delayAfter: API_SLOW_AFTER,
+  delayMs: () => API_SLOW_DELAY_MS, // express-slow-down v2 recommended style
+  maxDelayMs: API_SLOW_DELAY_MS,
+  skip: (req) => skipOptions(req) || isAuthRoute(req)
+});
+
+// API hard cap (exclude /api/auth)
+const apiHardLimiter = rateLimit({
+  windowMs: API_WINDOW_MS,
+  limit: API_HARD_LIMIT,
   standardHeaders: "draft-7",
   legacyHeaders: false,
-  skip: skipOptions, // do not count preflight
+  skip: (req) => skipOptions(req) || isAuthRoute(req),
   message: { ok: false, error: "Too many requests. Please try again shortly." }
 });
 
-// Auth slowdown (start delaying after N requests)
+// Auth slowdown
 const authSpeedLimiter = slowDown({
   windowMs: AUTH_WINDOW_MS,
   delayAfter: AUTH_SLOW_AFTER,
-  delayMs: AUTH_SLOW_DELAY_MS, // fixed delay (ms) :contentReference[oaicite:2]{index=2}
-  maxDelayMs: AUTH_SLOW_DELAY_MS, // keep it capped to the same fixed delay :contentReference[oaicite:3]{index=3}
+  delayMs: () => AUTH_SLOW_DELAY_MS,
+  maxDelayMs: AUTH_SLOW_DELAY_MS,
   skip: skipOptions
 });
 
-// Auth hard limiter (absolute cap)
+// Auth hard cap
 const authHardLimiter = rateLimit({
   windowMs: AUTH_WINDOW_MS,
   limit: AUTH_HARD_LIMIT,
@@ -160,7 +173,8 @@ const authHardLimiter = rateLimit({
   message: { ok: false, error: "Too many authentication attempts. Please wait and retry." }
 });
 
-app.use("/api", apiLimiter);
+// Apply limiters
+app.use("/api", apiSpeedLimiter, apiHardLimiter);
 app.use("/api/auth", authSpeedLimiter, authHardLimiter);
 
 // -------------------- Routes --------------------
@@ -171,8 +185,18 @@ app.get("/api/health", (req, res) => {
     env: NODE_ENV,
     allowedOrigins,
     rate: {
-      api: { windowMs: API_WINDOW_MS, hardLimit: API_HARD_LIMIT },
-      auth: { windowMs: AUTH_WINDOW_MS, slowAfter: AUTH_SLOW_AFTER, slowDelayMs: AUTH_SLOW_DELAY_MS, hardLimit: AUTH_HARD_LIMIT }
+      api: {
+        windowMs: API_WINDOW_MS,
+        slowAfter: API_SLOW_AFTER,
+        slowDelayMs: API_SLOW_DELAY_MS,
+        hardLimit: API_HARD_LIMIT
+      },
+      auth: {
+        windowMs: AUTH_WINDOW_MS,
+        slowAfter: AUTH_SLOW_AFTER,
+        slowDelayMs: AUTH_SLOW_DELAY_MS,
+        hardLimit: AUTH_HARD_LIMIT
+      }
     }
   });
 });
@@ -183,12 +207,19 @@ app.post("/api/auth/signup", async (req, res, next) => {
     const email = normalizeEmail(req.body?.email);
     const password = req.body?.password;
 
-    if (!name || name.length < 2) return res.status(400).json({ ok: false, error: "Name is required (minimum 2 characters)." });
-    if (!email || !isValidEmail(email)) return res.status(400).json({ ok: false, error: "A valid email address is required." });
-    if (!isStrongEnoughPassword(password)) return res.status(400).json({ ok: false, error: "Password must be at least 8 characters." });
+    if (!name || name.length < 2) {
+      return res.status(400).json({ ok: false, error: "Name is required (minimum 2 characters)." });
+    }
+    if (!email || !isValidEmail(email)) {
+      return res.status(400).json({ ok: false, error: "A valid email address is required." });
+    }
+    if (!isStrongEnoughPassword(password)) {
+      return res.status(400).json({ ok: false, error: "Password must be at least 8 characters." });
+    }
 
     const users = await readUsers();
-    if (users.some((u) => normalizeEmail(u.email) === email)) {
+    const exists = users.some((u) => normalizeEmail(u.email) === email);
+    if (exists) {
       return res.status(409).json({ ok: false, error: "User already exists. Please sign in." });
     }
 
@@ -207,7 +238,10 @@ app.post("/api/auth/signup", async (req, res, next) => {
     users.push(newUser);
     await writeUsers(users);
 
-    return res.status(201).json({ ok: true, user: { id: newUser.id, name: newUser.name, email: newUser.email } });
+    return res.status(201).json({
+      ok: true,
+      user: { id: newUser.id, name: newUser.name, email: newUser.email }
+    });
   } catch (err) {
     next(err);
   }
@@ -218,19 +252,28 @@ app.post("/api/auth/signin", async (req, res, next) => {
     const email = normalizeEmail(req.body?.email);
     const password = req.body?.password;
 
-    if (!email || !isValidEmail(email)) return res.status(400).json({ ok: false, error: "A valid email address is required." });
-    if (typeof password !== "string") return res.status(400).json({ ok: false, error: "Password is required." });
+    if (!email || !isValidEmail(email)) {
+      return res.status(400).json({ ok: false, error: "A valid email address is required." });
+    }
+    if (typeof password !== "string") {
+      return res.status(400).json({ ok: false, error: "Password is required." });
+    }
 
     const users = await readUsers();
     const user = users.find((u) => normalizeEmail(u.email) === email);
-    if (!user) return res.status(401).json({ ok: false, error: "Invalid credentials." });
+    if (!user) {
+      return res.status(401).json({ ok: false, error: "Invalid credentials." });
+    }
 
     const match = await bcrypt.compare(password, user.passwordHash);
-    if (!match) return res.status(401).json({ ok: false, error: "Invalid credentials." });
+    if (!match) {
+      return res.status(401).json({ ok: false, error: "Invalid credentials." });
+    }
 
     const accessToken = signAccessToken(user);
     const refreshToken = signRefreshToken(user);
 
+    // Single-session model: replace existing refresh token (simple and predictable)
     user.refreshTokenHash = await bcrypt.hash(refreshToken, 10);
     user.refreshIssuedAt = new Date().toISOString();
     await writeUsers(users);
@@ -249,7 +292,9 @@ app.post("/api/auth/signin", async (req, res, next) => {
 app.post("/api/auth/refresh", async (req, res, next) => {
   try {
     const refreshToken = String(req.body?.refreshToken || "");
-    if (!refreshToken) return res.status(400).json({ ok: false, error: "Refresh token is required." });
+    if (!refreshToken) {
+      return res.status(400).json({ ok: false, error: "Refresh token is required." });
+    }
 
     let payload;
     try {
@@ -264,11 +309,16 @@ app.post("/api/auth/refresh", async (req, res, next) => {
 
     const users = await readUsers();
     const user = users.find((u) => u.id === payload.sub);
-    if (!user || !user.refreshTokenHash) return res.status(401).json({ ok: false, error: "Refresh session not found." });
+    if (!user || !user.refreshTokenHash) {
+      return res.status(401).json({ ok: false, error: "Refresh session not found." });
+    }
 
-    const match = await bcrypt.compare(refreshToken, user.refreshTokenHash);
-    if (!match) return res.status(401).json({ ok: false, error: "Refresh token was revoked or replaced." });
+    const ok = await bcrypt.compare(refreshToken, user.refreshTokenHash);
+    if (!ok) {
+      return res.status(401).json({ ok: false, error: "Refresh token was revoked or replaced." });
+    }
 
+    // Rotate refresh token (keeps users signed in as long as they keep using the app)
     const newAccessToken = signAccessToken(user);
     const newRefreshToken = signRefreshToken(user);
 
@@ -276,7 +326,11 @@ app.post("/api/auth/refresh", async (req, res, next) => {
     user.refreshIssuedAt = new Date().toISOString();
     await writeUsers(users);
 
-    return res.json({ ok: true, accessToken: newAccessToken, refreshToken: newRefreshToken });
+    return res.json({
+      ok: true,
+      accessToken: newAccessToken,
+      refreshToken: newRefreshToken
+    });
   } catch (err) {
     next(err);
   }
@@ -303,6 +357,7 @@ app.post("/api/auth/logout", async (req, res, next) => {
       user.refreshIssuedAt = null;
       await writeUsers(users);
     }
+
     return res.json({ ok: true });
   } catch (err) {
     next(err);
@@ -319,7 +374,9 @@ function requireAccessAuth(req, res, next) {
 
   try {
     const payload = jwt.verify(token, JWT_SECRET);
-    if (payload?.type !== "access") return res.status(401).json({ ok: false, error: "Invalid access token." });
+    if (payload?.type !== "access") {
+      return res.status(401).json({ ok: false, error: "Invalid access token." });
+    }
     req.user = payload;
     return next();
   } catch {
@@ -331,7 +388,7 @@ app.get("/api/me", requireAccessAuth, (req, res) => {
   res.json({ ok: true, user: req.user });
 });
 
-// Error handler (also returns JSON for CORS blocks)
+// Error handler (CORS errors also returned as JSON)
 app.use((err, req, res, next) => {
   const msg = err?.message || "Server error";
   const isCors = msg.toLowerCase().includes("cors blocked");
@@ -341,6 +398,6 @@ app.use((err, req, res, next) => {
 app.listen(PORT, () => {
   console.log(`Backend running on http://localhost:${PORT}`);
   console.log(`Allowed origins: ${allowedOrigins.length ? allowedOrigins.join(", ") : "(none)"}`);
-  console.log(`API limit: ${API_HARD_LIMIT}/${Math.round(API_WINDOW_MS / 1000)}s`);
+  console.log(`API: slow after ${API_SLOW_AFTER}/${Math.round(API_WINDOW_MS / 1000)}s with ${API_SLOW_DELAY_MS}ms delay; hard cap ${API_HARD_LIMIT}`);
   console.log(`Auth: slow after ${AUTH_SLOW_AFTER}/${Math.round(AUTH_WINDOW_MS / 1000)}s with ${AUTH_SLOW_DELAY_MS}ms delay; hard cap ${AUTH_HARD_LIMIT}`);
 });
