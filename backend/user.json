@@ -1,12 +1,5 @@
 [
   {
-    "id": "09143238-97ba-4bb0-971d-407102e81f95",
-    "name": "x22",
-    "email": "abc@x.com",
-    "passwordHash": "$2a$12$5w4zvLc7miDuqkDA2V86muYMTQYzMMfnZtzcrz8jQtfHizrUBS2Nu",
-    "createdAt": "2025-12-18T10:49:57.911Z"
-  },
-  {
     "id": "90ed22e9-baf0-48f2-b682-5fa9454c50a0",
     "name": "abc",
     "email": "abc@abc.com",
